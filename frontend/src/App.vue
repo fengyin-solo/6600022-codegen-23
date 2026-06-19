@@ -1,18 +1,23 @@
 <template>
   <div class="min-h-screen bg-gray-950 flex flex-col items-center p-4">
-    <header class="w-full max-w-6xl mb-6">
+    <header class="w-full max-w-7xl mb-6">
       <h1 class="text-2xl font-bold text-green-400 text-center">棋类 AI 对弈与棋谱回放系统</h1>
-      <p class="text-center text-gray-500 text-sm mt-1">五子棋 · Minimax + Alpha-Beta 剪枝</p>
+      <p class="text-center text-gray-500 text-sm mt-1">五子棋 · Minimax + Alpha-Beta 剪枝 · 教学模式</p>
     </header>
 
-    <div class="flex flex-col lg:flex-row gap-6 max-w-6xl w-full items-start justify-center">
-      <!-- Board -->
-      <div class="flex-shrink-0">
-        <GameBoard />
+    <div class="flex flex-col xl:flex-row gap-6 max-w-7xl w-full items-start justify-center">
+      <!-- Left Sidebar - Teaching Panel -->
+      <div v-if="store.teachingConfig.enabled" class="w-full xl:w-80 space-y-4 order-2 xl:order-1">
+        <TeachingPanel @select-position="handleSelectPosition" />
       </div>
 
-      <!-- Sidebar -->
-      <div class="w-full lg:w-80 space-y-4">
+      <!-- Board -->
+      <div class="flex-shrink-0 order-1 xl:order-2">
+        <GameBoard :selected-position="selectedPosition" />
+      </div>
+
+      <!-- Right Sidebar -->
+      <div class="w-full xl:w-80 space-y-4 order-3">
         <!-- Game Status -->
         <div class="bg-gray-900 rounded-xl p-4 border border-gray-700">
           <h3 class="text-lg font-bold text-green-400 mb-3">游戏状态</h3>
@@ -108,6 +113,33 @@
           </div>
         </div>
 
+        <!-- Teaching Mode Toggle -->
+        <div class="bg-gray-900 rounded-xl p-4 border border-gray-700">
+          <div class="flex items-center justify-between mb-3">
+            <h3 class="text-lg font-bold text-green-400 flex items-center gap-2">
+              <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z"/>
+              </svg>
+              教学模式
+            </h3>
+            <button
+              @click="store.toggleTeachingMode()"
+              class="w-12 h-6 rounded-full transition-colors relative"
+              :class="store.teachingConfig.enabled ? 'bg-green-600' : 'bg-gray-700'"
+            >
+              <span
+                class="absolute top-0.5 w-5 h-5 bg-white rounded-full transition-transform"
+                :class="store.teachingConfig.enabled ? 'left-6' : 'left-0.5'"
+              />
+            </button>
+          </div>
+          <p class="text-xs text-gray-500">
+            {{ store.teachingConfig.enabled
+              ? '教学模式已开启，落子后将自动分析局面并给出策略提示'
+              : '开启教学模式，边下边学五子棋基础策略' }}
+          </p>
+        </div>
+
         <!-- Replay Panel -->
         <ReplayPanel />
       </div>
@@ -116,12 +148,15 @@
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue';
+import { ref, computed } from 'vue';
 import { useGameStore } from './store/game';
 import GameBoard from './components/GameBoard.vue';
 import ReplayPanel from './components/ReplayPanel.vue';
+import TeachingPanel from './components/TeachingPanel.vue';
 
 const store = useGameStore();
+
+const selectedPosition = ref<[number, number] | null>(null);
 
 const statusText = computed(() => {
   switch (store.status) {
@@ -132,4 +167,11 @@ const statusText = computed(() => {
     default: return '';
   }
 });
+
+function handleSelectPosition(row: number, col: number) {
+  selectedPosition.value = [row, col];
+  setTimeout(() => {
+    selectedPosition.value = null;
+  }, 2000);
+}
 </script>

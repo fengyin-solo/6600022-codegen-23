@@ -13,6 +13,11 @@
 <script setup lang="ts">
 import { ref, onMounted, watch, computed } from 'vue';
 import { useGameStore } from '../store/game';
+import type { HighlightPosition } from '../types';
+
+const props = defineProps<{
+  selectedPosition?: [number, number] | null;
+}>();
 
 const store = useGameStore();
 const canvasRef = ref<HTMLCanvasElement | null>(null);
@@ -28,6 +33,13 @@ const boardData = computed(() =>
 const movesList = computed(() =>
   store.status === 'replaying' ? store.replayMoves.slice(0, store.replayIndex) : store.moves
 );
+
+const highlightColors: Record<string, { fill: string; stroke: string }> = {
+  threat: { fill: 'rgba(239, 68, 68, 0.25)', stroke: 'rgba(239, 68, 68, 0.8)' },
+  opportunity: { fill: 'rgba(34, 197, 94, 0.25)', stroke: 'rgba(34, 197, 94, 0.8)' },
+  recommend: { fill: 'rgba(59, 130, 246, 0.25)', stroke: 'rgba(59, 130, 246, 0.8)' },
+  defense: { fill: 'rgba(234, 179, 8, 0.25)', stroke: 'rgba(234, 179, 8, 0.8)' },
+};
 
 function drawBoard(ctx: CanvasRenderingContext2D) {
   ctx.fillStyle = '#1a3a2a';
@@ -49,7 +61,6 @@ function drawBoard(ctx: CanvasRenderingContext2D) {
     ctx.stroke();
   }
 
-  // Star points
   const starPoints = [[3, 3], [3, 11], [11, 3], [11, 11], [7, 7]];
   ctx.fillStyle = '#5aaa7a';
   for (const [r, c] of starPoints) {
@@ -57,6 +68,54 @@ function drawBoard(ctx: CanvasRenderingContext2D) {
     ctx.arc(PADDING + c * CELL_SIZE, PADDING + r * CELL_SIZE, 4, 0, Math.PI * 2);
     ctx.fill();
   }
+}
+
+function drawHighlight(ctx: CanvasRenderingContext2D, hl: HighlightPosition, isTop: boolean) {
+  const x = PADDING + hl.col * CELL_SIZE;
+  const y = PADDING + hl.row * CELL_SIZE;
+  const radius = CELL_SIZE * 0.38;
+
+  const colors = highlightColors[hl.type] || highlightColors.recommend;
+
+  ctx.beginPath();
+  ctx.arc(x, y, radius, 0, Math.PI * 2);
+  ctx.fillStyle = colors.fill;
+  ctx.fill();
+
+  ctx.strokeStyle = colors.stroke;
+  ctx.lineWidth = isTop ? 2 : 1;
+  ctx.setLineDash(isTop ? [] : [4, 2]);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  if (isTop) {
+    ctx.fillStyle = colors.stroke;
+    ctx.font = 'bold 12px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    const label = hl.type === 'threat' ? '!' : hl.type === 'opportunity' ? '+' : hl.type === 'recommend' ? '★' : '△';
+    ctx.fillText(label, x, y);
+  }
+}
+
+function drawSelectedPosition(ctx: CanvasRenderingContext2D, row: number, col: number) {
+  const x = PADDING + col * CELL_SIZE;
+  const y = PADDING + row * CELL_SIZE;
+  const radius = CELL_SIZE * 0.45;
+
+  ctx.beginPath();
+  ctx.arc(x, y, radius, 0, Math.PI * 2);
+  ctx.strokeStyle = 'rgba(147, 51, 234, 0.9)';
+  ctx.lineWidth = 3;
+  ctx.setLineDash([6, 3]);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  ctx.beginPath();
+  ctx.arc(x, y, radius + 4, 0, Math.PI * 2);
+  ctx.strokeStyle = 'rgba(147, 51, 234, 0.4)';
+  ctx.lineWidth = 2;
+  ctx.stroke();
 }
 
 function drawStone(ctx: CanvasRenderingContext2D, row: number, col: number, player: number, isLast: boolean) {
@@ -90,6 +149,39 @@ function drawStone(ctx: CanvasRenderingContext2D, row: number, col: number, play
   }
 }
 
+function getHighlightPositions(): HighlightPosition[] {
+  if (!store.teachingConfig.enabled || !store.teachingConfig.showHighlights) {
+    return [];
+  }
+
+  const positions: HighlightPosition[] = [];
+  const seen = new Set<string>();
+
+  if (store.teachingContent?.nextHints && store.teachingContent.nextHints.length > 0) {
+    const topHint = store.teachingContent.nextHints[0];
+    const key = `${topHint.position[0]}-${topHint.position[1]}`;
+    seen.add(key);
+    positions.push({
+      row: topHint.position[0],
+      col: topHint.position[1],
+      type: 'recommend',
+      priority: topHint.priority,
+    });
+  }
+
+  if (store.boardAnalysis?.highlights) {
+    for (const hl of store.boardAnalysis.highlights) {
+      const key = `${hl.row}-${hl.col}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        positions.push(hl);
+      }
+    }
+  }
+
+  return positions.sort((a, b) => b.priority - a.priority);
+}
+
 function render() {
   const canvas = canvasRef.value;
   if (!canvas) return;
@@ -97,6 +189,15 @@ function render() {
   if (!ctx) return;
 
   drawBoard(ctx);
+
+  const highlights = getHighlightPositions();
+  for (let i = 0; i < highlights.length; i++) {
+    drawHighlight(ctx, highlights[i], i === 0);
+  }
+
+  if (props.selectedPosition) {
+    drawSelectedPosition(ctx, props.selectedPosition[0], props.selectedPosition[1]);
+  }
 
   const currentBoard = boardData.value;
   const currentMoves = movesList.value;
@@ -135,5 +236,16 @@ function handleClick(e: MouseEvent) {
 }
 
 onMounted(() => render());
-watch([boardData, () => store.replayIndex, () => store.status], () => render());
+watch(
+  [
+    boardData,
+    () => store.replayIndex,
+    () => store.status,
+    () => store.boardAnalysis,
+    () => store.teachingContent,
+    () => store.teachingConfig.showHighlights,
+    () => props.selectedPosition,
+  ],
+  () => render()
+);
 </script>

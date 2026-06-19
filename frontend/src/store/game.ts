@@ -1,6 +1,19 @@
 import { defineStore } from 'pinia';
 import { ref, computed } from 'vue';
-import type { BoardState, Move, GameRecord, AIConfig, GameStatus } from '../types';
+import type {
+  BoardState,
+  Move,
+  GameRecord,
+  AIConfig,
+  GameStatus,
+  PatternInfo,
+  PatternType,
+  BoardAnalysis,
+  TeachingContent,
+  TeachingConfig,
+  HighlightPosition,
+  NextHint,
+} from '../types';
 
 const BOARD_SIZE = 15;
 const EMPTY = 0;
@@ -189,6 +202,360 @@ function getAIMove(board: BoardState, aiPlayer: number, depth: number): [number,
   return bestMove;
 }
 
+// --- Teaching Mode: Pattern Recognition ---
+
+const PATTERN_NAMES: Record<PatternType, string> = {
+  'five': '五连',
+  'live-four': '活四',
+  'dead-four': '冲四',
+  'live-three': '活三',
+  'dead-three': '眠三',
+  'live-two': '活二',
+  'dead-two': '眠二',
+  'live-one': '活一',
+  'dead-one': '眠一',
+};
+
+const PATTERN_PRIORITY: Record<PatternType, number> = {
+  'five': 100,
+  'live-four': 90,
+  'dead-four': 80,
+  'live-three': 70,
+  'dead-three': 50,
+  'live-two': 40,
+  'dead-two': 20,
+  'live-one': 15,
+  'dead-one': 5,
+};
+
+function analyzeLineForPattern(
+  board: BoardState,
+  row: number,
+  col: number,
+  dr: number,
+  dc: number,
+  player: number
+): PatternInfo | null {
+  const fwd = countDirection(board, row, col, dr, dc, player);
+  const bwd = countDirection(board, row, col, -dr, -dc, player);
+  const count = 1 + fwd + bwd;
+
+  if (count >= 5) {
+    return {
+      type: 'five',
+      player,
+      row,
+      col,
+      direction: [dr, dc],
+      count,
+      openEnds: 0,
+    };
+  }
+
+  const fwdBlocked = !inBoundsTeaching(row + dr * (fwd + 1), col + dc * (fwd + 1)) ||
+    board[row + dr * (fwd + 1)]?.[col + dc * (fwd + 1)] !== EMPTY;
+  const bwdBlocked = !inBoundsTeaching(row - dr * (bwd + 1), col - dc * (bwd + 1)) ||
+    board[row - dr * (bwd + 1)]?.[col - dc * (bwd + 1)] !== EMPTY;
+
+  const openEnds = (fwdBlocked ? 0 : 1) + (bwdBlocked ? 0 : 1);
+
+  if (openEnds === 0 && count < 5) return null;
+
+  let type: PatternType;
+  if (count === 4) type = openEnds === 2 ? 'live-four' : 'dead-four';
+  else if (count === 3) type = openEnds === 2 ? 'live-three' : 'dead-three';
+  else if (count === 2) type = openEnds === 2 ? 'live-two' : 'dead-two';
+  else type = openEnds === 2 ? 'live-one' : 'dead-one';
+
+  return { type, player, row, col, direction: [dr, dc], count, openEnds };
+}
+
+function inBoundsTeaching(r: number, c: number): boolean {
+  return r >= 0 && r < BOARD_SIZE && c >= 0 && c < BOARD_SIZE;
+}
+
+function findAllPatterns(board: BoardState, player: number): PatternInfo[] {
+  const patterns: PatternInfo[] = [];
+  const seen = new Set<string>();
+
+  for (let r = 0; r < BOARD_SIZE; r++) {
+    for (let c = 0; c < BOARD_SIZE; c++) {
+      if (board[r][c] === player) {
+        for (const [dr, dc] of DIRECTIONS) {
+          const pattern = analyzeLineForPattern(board, r, c, dr, dc, player);
+          if (pattern) {
+            const key = `${pattern.type}-${r}-${c}-${dr}-${dc}`;
+            if (!seen.has(key)) {
+              seen.add(key);
+              patterns.push(pattern);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  patterns.sort((a, b) => PATTERN_PRIORITY[b.type] - PATTERN_PRIORITY[a.type]);
+  return patterns;
+}
+
+function findEmptyPositionsInPattern(
+  board: BoardState,
+  pattern: PatternInfo
+): [number, number][] {
+  const positions: [number, number][] = [];
+  const [dr, dc] = pattern.direction;
+  const fwd = countDirection(board, pattern.row, pattern.col, dr, dc, pattern.player);
+  const bwd = countDirection(board, pattern.row, pattern.col, -dr, -dc, pattern.player);
+
+  const fwdEmptyRow = pattern.row + dr * (fwd + 1);
+  const fwdEmptyCol = pattern.col + dc * (fwd + 1);
+  if (inBoundsTeaching(fwdEmptyRow, fwdEmptyCol) && board[fwdEmptyRow][fwdEmptyCol] === EMPTY) {
+    positions.push([fwdEmptyRow, fwdEmptyCol]);
+  }
+
+  const bwdEmptyRow = pattern.row - dr * (bwd + 1);
+  const bwdEmptyCol = pattern.col - dc * (bwd + 1);
+  if (inBoundsTeaching(bwdEmptyRow, bwdEmptyCol) && board[bwdEmptyRow][bwdEmptyCol] === EMPTY) {
+    positions.push([bwdEmptyRow, bwdEmptyCol]);
+  }
+
+  return positions;
+}
+
+function analyzeBoard(board: BoardState, currentPlayer: number): BoardAnalysis {
+  const opponent = currentPlayer === BLACK ? WHITE : BLACK;
+  const playerPatterns = findAllPatterns(board, currentPlayer);
+  const opponentPatterns = findAllPatterns(board, opponent);
+
+  const threats = opponentPatterns.filter(p =>
+    p.type === 'five' || p.type === 'live-four' || p.type === 'dead-four' || p.type === 'live-three'
+  );
+
+  const opportunities = playerPatterns.filter(p =>
+    p.type === 'five' || p.type === 'live-four' || p.type === 'dead-four' || p.type === 'live-three'
+  );
+
+  const highlights: HighlightPosition[] = [];
+  const seenHighlights = new Set<string>();
+
+  for (const threat of threats) {
+    const positions = findEmptyPositionsInPattern(board, threat);
+    for (const [r, c] of positions) {
+      const key = `${r}-${c}`;
+      if (!seenHighlights.has(key)) {
+        seenHighlights.add(key);
+        highlights.push({
+          row: r,
+          col: c,
+          type: 'defense',
+          priority: PATTERN_PRIORITY[threat.type],
+        });
+      }
+    }
+  }
+
+  for (const opp of opponentPatterns) {
+    if (opp.type === 'live-four' || opp.type === 'dead-four') {
+      const positions = findEmptyPositionsInPattern(board, opp);
+      for (const [r, c] of positions) {
+        const key = `${r}-${c}`;
+        if (!seenHighlights.has(key)) {
+          seenHighlights.add(key);
+          highlights.push({
+            row: r,
+            col: c,
+            type: 'threat',
+            priority: PATTERN_PRIORITY[opp.type] + 10,
+          });
+        }
+      }
+    }
+  }
+
+  for (const opp of opportunities) {
+    const positions = findEmptyPositionsInPattern(board, opp);
+    for (const [r, c] of positions) {
+      const key = `${r}-${c}`;
+      if (!seenHighlights.has(key)) {
+        seenHighlights.add(key);
+        highlights.push({
+          row: r,
+          col: c,
+          type: 'opportunity',
+          priority: PATTERN_PRIORITY[opp.type],
+        });
+      }
+    }
+  }
+
+  highlights.sort((a, b) => b.priority - a.priority);
+
+  return { playerPatterns, opponentPatterns, threats, opportunities, highlights };
+}
+
+function generateTeachingContent(
+  analysis: BoardAnalysis,
+  board: BoardState,
+  currentPlayer: number,
+  lastMove: Move | null,
+  moveCount: number,
+  difficulty: 'beginner' | 'intermediate' | 'advanced'
+): TeachingContent {
+  const opponent = currentPlayer === BLACK ? WHITE : BLACK;
+  const playerColor = currentPlayer === BLACK ? '黑棋' : '白棋';
+  const opponentColor = opponent === BLACK ? '黑棋' : '白棋';
+
+  const explanation: string[] = [];
+  const strategyTips: string[] = [];
+  const nextHints: NextHint[] = [];
+  const keyPoints: string[] = [];
+
+  let situation = '';
+
+  if (moveCount === 0) {
+    situation = '开局阶段，黑棋先行';
+    explanation.push('五子棋规则：黑棋先行，双方轮流在棋盘交叉点上落子。');
+    explanation.push('获胜条件：先在横、竖、斜任意方向形成连续五子同色者获胜。');
+    strategyTips.push('【开局策略】黑棋第一手建议下在天元（棋盘正中央），占据最有利位置。');
+    strategyTips.push('【基础原则】棋子要尽量下在靠近中心和已有棋子的位置，便于形成连接。');
+    keyPoints.push('中心位置价值最高，向四周逐渐降低');
+    keyPoints.push('活棋（两端都有空位）比死棋（一端被堵）价值高');
+    nextHints.push({
+      position: [7, 7],
+      reason: '占据天元，控制棋盘中心',
+      strategy: '开局第一手，天元是最优位置',
+      priority: 100,
+    });
+    return { situation, explanation, strategyTips, nextHints, keyPoints };
+  }
+
+  if (lastMove) {
+    const lastColor = lastMove.player === BLACK ? '黑棋' : '白棋';
+    const coord = `(${String.fromCharCode(65 + lastMove.col)}${15 - lastMove.row})`;
+    situation = `第 ${moveCount} 手，${lastColor} 落子于 ${coord}`;
+  }
+
+  const winningPattern = analysis.playerPatterns.find(p => p.type === 'five');
+  if (winningPattern) {
+    explanation.push(`🎉 ${playerColor}已经形成五连，获胜！`);
+    return { situation, explanation, strategyTips, nextHints, keyPoints };
+  }
+
+  const opponentWinning = analysis.opponentPatterns.find(p => p.type === 'five');
+  if (opponentWinning) {
+    explanation.push(`😢 ${opponentColor}已经形成五连，${playerColor}输了。`);
+    explanation.push('复盘思考：为什么没有提前防守？注意观察对方的威胁棋型。');
+    return { situation, explanation, strategyTips, nextHints, keyPoints };
+  }
+
+  if (moveCount <= 6) {
+    explanation.push('当前处于布局阶段，双方都在抢占要点。');
+    if (difficulty === 'beginner') {
+      strategyTips.push('【布局原则1】棋子不要太分散，要互相呼应，便于后续形成连接。');
+      strategyTips.push('【布局原则2】避免下在边角，边角位置发展空间有限。');
+      strategyTips.push('【布局原则3】注意观察对方的棋型，不要让对方轻易形成活三、活四。');
+    }
+  } else if (moveCount <= 15) {
+    explanation.push('当前进入中盘阶段，开始形成各种棋型，攻守逐渐激烈。');
+  } else {
+    explanation.push('当前进入尾盘阶段，棋型已基本定型，需要精确计算每一步。');
+  }
+
+  if (analysis.threats.length > 0) {
+    const topThreat = analysis.threats[0];
+    const threatName = PATTERN_NAMES[topThreat.type];
+    explanation.push(`⚠️ 【防守预警】${opponentColor}形成了${threatName}，需要立即防守！`);
+
+    if (topThreat.type === 'live-four') {
+      explanation.push('活四只有两个端点可以防守，但对方可以任选一端成五，所以活四是必胜棋型！');
+      keyPoints.push('活四：两端都有空位的四连，无法防守，是必胜棋型');
+    } else if (topThreat.type === 'dead-four') {
+      explanation.push('冲四只有一端可以成五，必须堵住那个空位！');
+      keyPoints.push('冲四：只有一端有空位的四连，堵住空位即可防守');
+    } else if (topThreat.type === 'live-three') {
+      explanation.push('活三如果不防守，下一步就会变成活四，也是很危险的棋型！');
+      keyPoints.push('活三：两端都有空位的三连，下一步可变活四，必须防守');
+    }
+
+    const defensePositions = findEmptyPositionsInPattern(board, topThreat);
+    for (const [r, c] of defensePositions.slice(0, 2)) {
+      nextHints.push({
+        position: [r, c],
+        reason: `防守${opponentColor}的${threatName}`,
+        strategy: '优先防守对方的必胜棋型',
+        priority: 100,
+      });
+    }
+  }
+
+  if (analysis.opportunities.length > 0) {
+    const topOpp = analysis.opportunities[0];
+    const oppName = PATTERN_NAMES[topOpp.type];
+    explanation.push(`✨ 【进攻机会】${playerColor}有${oppName}，可以考虑进攻！`);
+
+    if (topOpp.type === 'live-four') {
+      explanation.push('你有活四！这是必胜棋型，直接在任意一端落子成五即可获胜！');
+      keyPoints.push('活四必胜：两个端点任选其一即可成五');
+    } else if (topOpp.type === 'dead-four') {
+      explanation.push('你有冲四！在空位落子即可成五，或者先看看有没有更重要的防守。');
+    } else if (topOpp.type === 'live-three') {
+      explanation.push('你有活三！如果对方不防守，下一步可以成活四，形成必胜局面。');
+      keyPoints.push('活三进攻：如果对方不防守，下一步成活四');
+    }
+
+    const oppPositions = findEmptyPositionsInPattern(board, topOpp);
+    for (const [r, c] of oppPositions.slice(0, 2)) {
+      nextHints.push({
+        position: [r, c],
+        reason: `延伸自己的${oppName}`,
+        strategy: topOpp.type === 'live-four' || topOpp.type === 'dead-four'
+          ? '直接进攻获胜'
+          : '积极进攻，制造威胁',
+        priority: topOpp.type === 'live-four' || topOpp.type === 'dead-four' ? 95 : 80,
+      });
+    }
+  }
+
+  if (analysis.threats.length === 0 && analysis.opportunities.length === 0) {
+    explanation.push('目前局面平稳，没有明显的攻守机会。');
+    strategyTips.push('【稳健策略】可以选择靠近己方棋子的位置落子，发展自己的棋型。');
+    strategyTips.push('【进攻意识】尝试形成活二、活三，为后续进攻做准备。');
+
+    if (lastMove) {
+      const aroundPositions: [number, number][] = [];
+      for (let dr = -2; dr <= 2; dr++) {
+        for (let dc = -2; dc <= 2; dc++) {
+          const nr = lastMove.row + dr;
+          const nc = lastMove.col + dc;
+          if (inBoundsTeaching(nr, nc) && board[nr]?.[nc] === EMPTY) {
+            aroundPositions.push([nr, nc]);
+          }
+        }
+      }
+      if (aroundPositions.length > 0) {
+        const [r, c] = aroundPositions[Math.floor(aroundPositions.length / 2)];
+        nextHints.push({
+          position: [r, c],
+          reason: '靠近已有棋子，发展棋型',
+          strategy: '稳扎稳打，逐步扩大优势',
+          priority: 50,
+        });
+      }
+    }
+  }
+
+  if (difficulty === 'beginner' && keyPoints.length === 0) {
+    keyPoints.push('先看对方有没有威胁，再看自己有没有进攻机会');
+    keyPoints.push('活棋优先：活四 > 冲四 > 活三 > 眠三 > 活二');
+    keyPoints.push('防守优先于无意义的进攻');
+  }
+
+  nextHints.sort((a, b) => b.priority - a.priority);
+
+  return { situation, explanation, strategyTips, nextHints, keyPoints };
+}
+
 // --- Store ---
 
 export const useGameStore = defineStore('game', () => {
@@ -201,6 +568,16 @@ export const useGameStore = defineStore('game', () => {
   const aiConfig = ref<AIConfig>({ depth: 3, enabled: true, playerColor: WHITE });
   const isAiThinking = ref(false);
 
+  // Teaching Mode
+  const teachingConfig = ref<TeachingConfig>({
+    enabled: false,
+    showHighlights: true,
+    showHints: true,
+    difficulty: 'beginner',
+  });
+  const boardAnalysis = ref<BoardAnalysis | null>(null);
+  const teachingContent = ref<TeachingContent | null>(null);
+
   // Replay
   const replayMoves = ref<Move[]>([]);
   const replayIndex = ref(0);
@@ -211,6 +588,33 @@ export const useGameStore = defineStore('game', () => {
   const currentMoveCount = computed(() => moves.value.length);
   const isGameOver = computed(() => status.value === 'finished');
 
+  function updateAnalysis() {
+    if (!teachingConfig.value.enabled) {
+      boardAnalysis.value = null;
+      teachingContent.value = null;
+      return;
+    }
+
+    const currentBoard = status.value === 'replaying' ? replayBoard.value : board.value;
+    const analysis = analyzeBoard(currentBoard, currentPlayer.value);
+    boardAnalysis.value = analysis;
+
+    const lastMove = moves.value.length > 0 ? moves.value[moves.value.length - 1] : null;
+    teachingContent.value = generateTeachingContent(
+      analysis,
+      currentBoard,
+      currentPlayer.value,
+      lastMove,
+      moves.value.length,
+      teachingConfig.value.difficulty
+    );
+  }
+
+  function getPatternEmptyPositions(pattern: PatternInfo): [number, number][] {
+    const currentBoard = status.value === 'replaying' ? replayBoard.value : board.value;
+    return findEmptyPositionsInPattern(currentBoard, pattern);
+  }
+
   function startGame() {
     board.value = createEmptyBoard();
     currentPlayer.value = BLACK;
@@ -218,6 +622,7 @@ export const useGameStore = defineStore('game', () => {
     status.value = 'playing';
     winner.value = null;
     isAiThinking.value = false;
+    updateAnalysis();
   }
 
   function placeStone(row: number, col: number): boolean {
@@ -233,6 +638,7 @@ export const useGameStore = defineStore('game', () => {
       winner.value = currentPlayer.value;
       status.value = 'finished';
       saveRecord();
+      updateAnalysis();
       return true;
     }
 
@@ -240,10 +646,12 @@ export const useGameStore = defineStore('game', () => {
       winner.value = 0;
       status.value = 'finished';
       saveRecord();
+      updateAnalysis();
       return true;
     }
 
     currentPlayer.value = currentPlayer.value === BLACK ? WHITE : BLACK;
+    updateAnalysis();
     return true;
   }
 
@@ -355,12 +763,19 @@ export const useGameStore = defineStore('game', () => {
     return checkWinAt(board.value, row, col, board.value[row][col]);
   }
 
+  function toggleTeachingMode() {
+    teachingConfig.value.enabled = !teachingConfig.value.enabled;
+    updateAnalysis();
+  }
+
   return {
     board, currentPlayer, moves, status, winner, gameRecords, aiConfig, isAiThinking,
     replayMoves, replayIndex, replayBoard, isReplayPlaying, replaySpeed,
+    teachingConfig, boardAnalysis, teachingContent,
     currentMoveCount, isGameOver,
     startGame, placeStone, aiMove, saveRecord,
     startReplay, replayStepForward, replayStepBack, replayGoToStart, replayGoToEnd,
     toggleReplayPlay, setReplaySpeed, stopReplay, checkWin,
+    updateAnalysis, toggleTeachingMode, getPatternEmptyPositions,
   };
 });
